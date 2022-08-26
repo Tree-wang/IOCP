@@ -1,0 +1,234 @@
+
+/*
+* 一般流程：
+* 1. CreateIoCompletionPort() 创建一个完成端口；
+* 2. 创建多个工作者线程；
+* 3. 单独起个线程accept、或者使用Acceptex函数接收；(使用AcceptEx函数的优点和产生的高效)
+* 4. 得到客户端连接的时候，使用CreateIoCompletionPort()绑定；
+* 5. 工作线程中，使用GetQueuedCompletionStatus()来扫描端口完成的队列中；
+*
+*
+*
+*
+* WSASocket是Windows专用，支持异步操作；
+	socket是unix标准，只能同步操作；
+
+*/
+
+
+
+
+
+#include <stdio.h>
+#include <iostream>
+#include <stdlib.h>
+#include <winsock2.h>
+#include <windows.h>
+
+#pragma comment(lib,"ws2_32.lib")
+
+
+#define ServerPort 10086
+#define MAX_BUFFER_LEN 1024
+
+enum OPERATION_TYPE {
+	READ,
+	WRITE
+};
+
+
+typedef struct                                               // 保存与客户端相连套接字
+{
+	SOCKET m_clientSock;
+	SOCKADDR_IN m_clientAddr;
+}PER_HANDLE_DATA, * LPPER_HANDLE_DATA;
+
+
+typedef struct _PER_IO_CONTEXT {
+	OVERLAPPED   m_Overlapped;          // 每一个重叠I/O网络操作都要有一个
+	SOCKET       m_sockAccept;          // 这个I/O操作所使用的Socket，每个连接的都是一样的
+	WSABUF       m_wsaBuf;              // 存储数据的缓冲区，用来给重叠操作传递参数的，关于WSABUF后面还会讲
+	char         m_szBuffer[MAX_BUFFER_LEN]; // 对应WSABUF里的缓冲区
+	OPERATION_TYPE  m_OpType;               // 标志这个重叠I/O操作是做什么的，例如Accept/Recv等
+
+} PER_IO_CONTEXT, * PPER_IO_CONTEXT;
+
+
+
+ 
+
+
+
+/*
+*	完成基本初始化
+*/
+int InitServer()
+{
+	//1. 初始化环境
+	WSADATA wsaData;
+	WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+	//2 .创建socket(WSASocket与socket的区别)
+	int m_sockListen = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+
+	//3. 设置SO_REUSEADDR
+	//端口复用允许在一个应用程序可以把 n 个套接字绑在一个端口上而不出错。
+	//设置端口复用函数要在绑定之前调用，而且只要绑定到同一个端口的所有套接字都得设置复用
+	int on = 1;
+	setsockopt(m_sockListen, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+
+	//4. bind 
+	
+	//用0填充一块区域，Destination :指向一块准备用0来填充的内存区域的开始地址。Length:准备用0来填充的内存区域的大小，按字节来计算。
+	struct sockaddr_in ServerAddress;
+	ZeroMemory((char*)&ServerAddress, sizeof(ServerAddress));
+	ServerAddress.sin_family = AF_INET;
+	ServerAddress.sin_addr.s_addr = htonl(INADDR_ANY);
+	ServerAddress.sin_port = htons(ServerPort);
+	bind(m_sockListen, (struct sockaddr*)&ServerAddress, sizeof(ServerAddress));
+	//4. listen  (注意SOMAXCONN)
+	listen(m_sockListen, SOMAXCONN);
+	return m_sockListen;
+}
+
+/*
+*	工作者线程
+*/
+int WINAPI _WorkerThread(LPVOID param)
+{
+	HANDLE CompletionPort = (HANDLE)param;
+	DWORD dwBytesTransferred;
+	LPPER_HANDLE_DATA PerHandleData;
+	PPER_IO_CONTEXT PerIoData;
+	while (true) {
+
+		//让出CPU睡眠
+		//直到完成端口上出现了需要处理的网络操作或者超出了等待的时间限制为止。
+		//  BOOL WINAPI GetQueuedCompletionStatus(  
+		//  __in   HANDLE          CompletionPort,    // 建立的完成端口  
+		//	__out  LPDWORD         lpNumberOfBytes,   //返回的字节数  
+		//	__out  PULONG_PTR      lpCompletionKey,   // 与完成端口的时候绑定的那个socket对应的自定义结构体PER_HANDLE_DATA
+		//	__out  LPOVERLAPPED* lpOverlapped,     // 重叠结构  
+		//	__in   DWORD           dwMilliseconds     // 等待完成端口的超时时间，一般设置INFINITE  
+		//	);
+
+		BOOL bReturn = GetQueuedCompletionStatus(CompletionPort, &dwBytesTransferred, (LPDWORD)&PerHandleData, (LPOVERLAPPED*)&PerIoData, INFINITE);
+		if (bReturn == FALSE) {
+			if ((GetLastError() == WAIT_TIMEOUT) || (GetLastError() == ERROR_NETNAME_DELETED)) {
+				std::cout << "closingsocket" << PerHandleData->m_clientSock << std::endl;
+				closesocket(PerHandleData->m_clientSock);
+
+				delete PerIoData;
+				delete PerHandleData;
+				continue;
+			}
+			else
+			{
+				std::cout << ("GetQueuedCompletionStatus failed!") << std::endl;
+			}
+			return 0;
+		}
+
+		// 说明客户端已经退出  
+		if (dwBytesTransferred == 0)
+		{
+			std::cout << "closing socket" << PerHandleData->m_clientSock << std::endl;
+			closesocket(PerHandleData->m_clientSock);
+			delete PerIoData;
+			delete PerHandleData;
+			continue;
+		}
+
+		// 取得数据并处理  
+		std::cout << PerHandleData->m_clientSock << "长度:" << dwBytesTransferred << ",发送过来的消息：" << PerIoData->m_szBuffer << std::endl;
+
+		// 继续向 socket 投递WSARecv操作  
+		DWORD Flags = 0;
+		DWORD dwRecv = 0;
+		ZeroMemory(PerIoData, sizeof(PPER_IO_CONTEXT));
+		PerIoData->m_wsaBuf.buf = PerIoData->m_szBuffer;
+		PerIoData->m_wsaBuf.len = MAX_BUFFER_LEN;
+		//传递参数，调用就行
+		//int WSARecv(
+		//	SOCKET socket,                       // 投递的套接字  
+		//	LPWSABUF lpBuffers,                 // 接收缓冲区WSABUF结构构成的数组  
+		//	DWORD dwBufferCount,                // 数组中WSABUF结构的数量，设置为1  
+		//	LPDWORD lpNumberOfBytesRecvd,       // 返回函数调用所接收到的字节数  
+		//	LPDWORD lpFlags,                    // 设置为0  
+		//	LPWSAOVERLAPPED lpOverlapped,       // Socket对应的重叠结构  
+		//	NULL                                // 设置完成例程模式，这里设置为NULL 
+		//);
+
+		WSARecv(PerHandleData->m_clientSock, &PerIoData->m_wsaBuf, 1, &dwRecv, &Flags, &PerIoData->m_Overlapped, NULL);
+	}
+	return 0;
+}
+
+
+
+/*
+*	main主线程函数
+* HANDLE WINAPI CreateIoCompletionPort(
+	__in      HANDLE  FileHandle,             // 这里当然是连入的这个套接字句柄了
+	 __in_opt  HANDLE  ExistingCompletionPort, // 这个就是前面创建的那个完成端口
+	 __in      ULONG_PTR CompletionKey,        // 这个参数就是类似于线程参数一样，在
+											   // 绑定的时候把自己定义的结构体指针传递
+											   // 这样到了Worker线程中，也可以使用这个
+											   // 结构体的数据了，相当于参数的传递
+	 __in      DWORD NumberOfConcurrentThreads // 这里同样置0
+);
+*/
+
+int main()
+{
+	DWORD  recvBytes, i, flags = 0;
+	//1. 初始化服务
+	int m_listensocket = InitServer();
+
+	//2.创建一个iocp的端口,最后参数：NumberOfConcurrentThreads，设置为0，处理器数量=线程运行的数量
+	//建立一个完成端口
+	HANDLE m_hIOCompletionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	if (m_hIOCompletionPort == NULL) {
+		std::cout << "error" << __LINE__ << std::endl;
+		return 0;
+	}
+
+	//3. 创建对应数量的工作者线程，一般是CPU核心数量*2
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	int m_nThreads = si.dwNumberOfProcessors * 2;
+	HANDLE* m_phWorkerThreads = new HANDLE[m_nThreads];
+
+	for (int i = 0; i < m_nThreads; i++) {
+		//将IOCP对象作为线程参数传递
+		m_phWorkerThreads[i] = ::CreateThread(0, 0, (LPTHREAD_START_ROUTINE)_WorkerThread, m_hIOCompletionPort, 0, 0);
+	}
+
+	//4. 将监听端口与iocp绑定
+	CreateIoCompletionPort((HANDLE)m_listensocket, m_hIOCompletionPort, 0, 0);
+
+	//5. 进入accept
+	while (true) {
+		SOCKADDR_IN clntAdr;
+		int addrLen = sizeof(clntAdr);
+
+		int hClntSock = accept(m_listensocket, (SOCKADDR*)&clntAdr, &addrLen);
+		LPPER_HANDLE_DATA  handleInfo = (LPPER_HANDLE_DATA)malloc(sizeof(PER_HANDLE_DATA));
+		handleInfo->m_clientSock = hClntSock;
+		memcpy(&(handleInfo->m_clientAddr), &clntAdr, addrLen);
+
+		//6. 将这个对象绑定到已经创建的完成端口对象（m_hIOCompletionPort）,并且关联客户端的信息（端口和aadr） epoll_ctl
+		//传递的第三个参数，与GetQueuedCompletionStatus函数有关，完成绑定
+		CreateIoCompletionPort((HANDLE)hClntSock, m_hIOCompletionPort, (DWORD)handleInfo, 0);
+
+		//7. 投递RECV事件（epoll_ctl）
+		PER_IO_CONTEXT* ioInfo = (PER_IO_CONTEXT*)malloc(sizeof(PER_IO_CONTEXT));                         // 相当于同时准备了WSARecv函数中需要的OVERLAPPED结构体变量、WSABUF结构体变量和缓冲
+		memset(&(ioInfo->m_Overlapped), 0, sizeof(OVERLAPPED));
+		ioInfo->m_wsaBuf.len = MAX_BUFFER_LEN;
+		ioInfo->m_wsaBuf.buf = ioInfo->m_szBuffer;
+		ioInfo->m_OpType = READ;                                                       // 需要额外的变量区分2种I/O
+		WSARecv(handleInfo->m_clientSock, &(ioInfo->m_wsaBuf), 1, &recvBytes, &flags, &(ioInfo->m_Overlapped), NULL);  // 第六个参数相当于传入了PER_IO_DATA结构体变量地址值
+
+	}
+	return 0;
+}
